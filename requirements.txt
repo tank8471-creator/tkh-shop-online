@@ -1,4 +1,4 @@
 flask
 gunicorn
-promptpay-qr
+promptpay_qr
 pillow
