@@ -2,11 +2,14 @@ import sqlite3
 import io
 import base64
 import webbrowser
-from flask import Flask, render_template_string, request, session, jsonify
+from flask import Flask, render_template_string, request, session, jsonify, redirect, url_for
 from promptpay_qr import generate_qr_image
 
 app = Flask(__name__)
 app.secret_key = "tkh-shop-secret-key"
+
+# 🔑 รหัสผ่านสำหรับเจ้าของร้านเข้าสู่ระบบจัดการ (เปลี่ยนเป็นรหัสของคุณได้ตรงนี้)
+ADMIN_PASSWORD = "123456"
 
 PROMPTPAY_ID = "0948206384"
 DEFAULT_HERO_BG = "https://images.unsplash.com/photo-1558981806-ec527fa84c39?auto=format&fit=crop&w=1200&q=80"
@@ -25,7 +28,7 @@ def get_db():
 def init_db():
     conn = get_db()
     
-    # 1. ตารางสินค้า (เพิ่ม stock และ sold)
+    # 1. ตารางสินค้า
     conn.execute('''
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,7 +50,6 @@ def init_db():
         )
     ''')
     
-    # ป้องกัน Migration Error สำหรับฐานข้อมูลเดิม
     try:
         conn.execute("ALTER TABLE products ADD COLUMN category TEXT DEFAULT 'ทั่วไป'")
     except sqlite3.OperationalError:
@@ -63,7 +65,6 @@ def init_db():
         
     conn.commit()
 
-    # ตั้งค่าข้อมูลติดต่อเริ่มต้น
     default_contacts = {
         'phone': '094-820-6384',
         'line': '@tkhshop',
@@ -75,7 +76,6 @@ def init_db():
         conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (f"contact_{key}", val))
     conn.commit()
 
-    # ข้อมูลสินค้าตัวอย่าง
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM products")
     if cur.fetchone()[0] == 0:
@@ -195,7 +195,6 @@ COMMON_STYLE = """
     }
     .form-group input:focus, .form-group textarea:focus, .form-group select:focus { border-color: #e50914; outline: none; }
 
-    /* Stock Stats Box */
     .stock-dashboard {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -226,18 +225,146 @@ def check_payment():
         return jsonify({"paid": True})
     return jsonify({"paid": False})
 
-# ===== 1. หน้าแรก (แสดงสต็อกและยอดขายเรียลไทม์) =====
+# ===== ระบบยืนยันตัวตน Admin =====
+def is_admin_logged_in():
+    return session.get('is_admin', False)
+
+@app.route('/admin-login', methods=['GET', 'POST'])
+def admin_login():
+    if request.method == 'POST':
+        password = request.form.get('password')
+        if password == ADMIN_PASSWORD:
+            session['is_admin'] = True
+            return redirect(url_for('admin_dashboard'))
+        else:
+            return '<script>alert("❌ รหัสผ่านผู้ดูแลระบบไม่ถูกต้อง!"); location.href="/admin-login";</script>'
+            
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>เข้าสู่ระบบผู้ดูแลร้าน - TKH Shop</title>
+        {COMMON_STYLE}
+    </head>
+    <body>
+        <nav class="navbar">
+            <a href="/" class="logo">TKH<span>SHOP</span></a>
+            <a href="/" class="btn btn-outline">← กลับหน้าหลัก</a>
+        </nav>
+        <div class="container">
+            <div class="form-card">
+                <h2 style="margin-bottom: 20px; text-align: center;">🔐 เข้าสู่ระบบผู้ดูแลร้าน (Admin)</h2>
+                <form method="post">
+                    <div class="form-group">
+                        <label>กรอกรหัสผ่านผู้ดูแลระบบ:</label>
+                        <input type="password" name="password" placeholder="ใส่รหัสผ่านที่นี่..." required>
+                    </div>
+                    <button type="submit" class="btn btn-red" style="width: 100%; padding: 12px;">เข้าสู่ระบบ</button>
+                </form>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return html
+
+@app.route('/admin-logout')
+def admin_logout():
+    session.pop('is_admin', None)
+    return redirect(url_for('index'))
+
+@app.route('/admin')
+def admin_dashboard():
+    if not is_admin_logged_in():
+        return redirect(url_for('admin_login'))
+        
+    conn = get_db()
+    total_stock_all = conn.execute("SELECT SUM(stock) FROM products").fetchone()[0] or 0
+    total_sold_all = conn.execute("SELECT SUM(sold) FROM products").fetchone()[0] or 0
+    products = conn.execute("SELECT * FROM products ORDER BY id DESC").fetchall()
+    conn.close()
+
+    products_rows = ""
+    for p in products:
+        products_rows += f"""
+        <tr style="border-bottom: 1px solid #222;">
+            <td style="padding: 12px;">{p['id']}</td>
+            <td style="padding: 12px; font-weight: bold;">{p['name']}</td>
+            <td style="padding: 12px; color: #e50914;">฿{p['price']:,.2f}</td>
+            <td style="padding: 12px;">{p['stock']} ชิ้น</td>
+            <td style="padding: 12px; color: #00ff66;">{p['sold']} ชิ้น</td>
+            <td style="padding: 12px;">
+                <a href="/edit-product/{p['id']}" class="btn btn-gray" style="padding: 4px 8px; font-size: 12px;">✏️ แก้ไข</a>
+            </td>
+        </tr>
+        """
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>แผงควบคุมผู้ดูแลร้าน - TKH Shop</title>
+        {COMMON_STYLE}
+    </head>
+    <body>
+        <nav class="navbar">
+            <a href="/" class="logo">TKH<span>SHOP</span> <small style="font-size: 12px; color: #e50914;">[ADMIN]</small></a>
+            <div class="nav-actions">
+                <a href="/add-product" class="btn btn-outline">➕ เพิ่มสินค้าใหม่</a>
+                <a href="/change-hero-bg" class="btn btn-gray">🖼️ เปลี่ยนรูปพื้นหลัง</a>
+                <a href="/admin-logout" class="btn btn-red">ออกจากระบบ</a>
+            </div>
+        </nav>
+
+        <div class="container" style="margin-top: 30px;">
+            <h2 style="margin-bottom: 20px;">📊 ภาพรวมร้านค้าและจัดการสต็อก</h2>
+            <div class="stock-dashboard">
+                <div class="stock-stat-card total">
+                    <div>
+                        <div class="stat-lbl">📦 จำนวนสินค้าคงเหลือรวม</div>
+                        <div class="stat-val">{total_stock_all:,} <span style="font-size:14px; font-weight:normal; color:#aaa;">ชิ้น</span></div>
+                    </div>
+                </div>
+                <div class="stock-stat-card sales">
+                    <div>
+                        <div class="stat-lbl">🔥 จำนวนสินค้าขายออกแล้ว</div>
+                        <div class="stat-val" style="color: #00ff66;">{total_sold_all:,} <span style="font-size:14px; font-weight:normal; color:#aaa;">ชิ้น</span></div>
+                    </div>
+                </div>
+            </div>
+
+            <h3 style="margin-bottom: 15px;">📦 รายการสินค้าทั้งหมด</h3>
+            <table style="width: 100%; border-collapse: collapse; background: #141414; border-radius: 8px; overflow: hidden; border: 1px solid #222; text-align: left;">
+                <thead>
+                    <tr style="background: #1f1f1f; color: #aaa; font-size: 13px;">
+                        <th style="padding: 12px;">ID</th>
+                        <th style="padding: 12px;">ชื่อสินค้า</th>
+                        <th style="padding: 12px;">ราคา</th>
+                        <th style="padding: 12px;">คงเหลือ</th>
+                        <th style="padding: 12px;">ขายแล้ว</th>
+                        <th style="padding: 12px;">จัดการ</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {products_rows}
+                </tbody>
+            </table>
+        </div>
+    </body>
+    </html>
+    """
+    return html
+
+
+# ===== 1. หน้าแรก (สำหรับลูกค้าทั่วไป) =====
 @app.route('/')
 def index():
     cart = session.get('cart', [])
     selected_cat = request.args.get('category', '')
     
     conn = get_db()
-    
-    # คำนวณสต็อกรวมและยอดขายรวมทั้งหมดในร้าน
-    total_stock_all = conn.execute("SELECT SUM(stock) FROM products").fetchone()[0] or 0
-    total_sold_all = conn.execute("SELECT SUM(sold) FROM products").fetchone()[0] or 0
-    
     if selected_cat and selected_cat != 'ทั้งหมด':
         products = conn.execute("SELECT * FROM products WHERE category = ? ORDER BY id DESC", (selected_cat,)).fetchall()
     else:
@@ -268,7 +395,6 @@ def index():
                 </div>
                 <p class="product-desc">{p['desc']}</p>
                 
-                <!-- แสดงสต็อก และ จำนวนที่ขายออกแล้ว -->
                 <div style="background: #080808; padding: 8px 12px; border-radius: 4px; border: 1px solid #222; font-size: 12px; display: flex; justify-content: space-between; margin-bottom: 12px;">
                     {stock_status}
                     <span style="color: #aaa;">🔥 ขายแล้ว: <strong style="color: #fff;">{sold_count}</strong> ชิ้น</span>
@@ -277,13 +403,12 @@ def index():
                 <div class="product-actions">
                     <form action="/add-to-cart" method="post" style="flex: 1;">
                         <input type="hidden" name="pid" value="{p['id']}">
-                        <button class="btn btn-outline" style="width: 100%;" {"disabled" if stock_count <= 0 else ""}>{"สั่งซื้อทันที" if stock_count > 0 else "หมด"}</button>
+                        <button class="btn btn-red" style="width: 100%;" {"disabled" if stock_count <= 0 else ""}>{"สั่งซื้อทันที" if stock_count > 0 else "หมด"}</button>
                     </form>
                     <form action="/add-to-cart" method="post">
                         <input type="hidden" name="pid" value="{p['id']}">
                         <button class="btn btn-gray" title="เพิ่มลงตะกร้า" {"disabled" if stock_count <= 0 else ""}>🛒</button>
                     </form>
-                    <a href="/edit-product/{p['id']}" class="btn btn-gray" title="แก้ไขสินค้า">✏️</a>
                 </div>
             </div>
         </div>
@@ -315,20 +440,6 @@ def index():
             .hero-subtitle {{ color: #e50914; font-weight: 800; letter-spacing: 2px; font-size: 14px; text-transform: uppercase; margin-bottom: 10px; }}
             .hero-title {{ font-size: 48px; font-weight: 800; font-style: italic; line-height: 1.1; margin-bottom: 15px; text-shadow: 2px 2px 4px rgba(0,0,0,0.8); }}
             .hero-text {{ color: #aaa; font-size: 16px; margin-bottom: 25px; line-height: 1.5; }}
-            
-            .change-bg-btn {{
-                position: absolute;
-                top: 20px;
-                right: 20px;
-                background: rgba(0, 0, 0, 0.7);
-                border: 1px solid #444;
-                color: #fff;
-                padding: 8px 14px;
-                border-radius: 4px;
-                font-size: 12px;
-                cursor: pointer;
-            }}
-            .change-bg-btn:hover {{ background: #e50914; border-color: #e50914; }}
 
             .section-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; border-bottom: 2px solid #222; padding-bottom: 10px; }}
             .section-title {{ font-size: 22px; font-weight: 800; font-style: italic; text-transform: uppercase; position: relative; }}
@@ -385,13 +496,12 @@ def index():
                 <li><a href="/contact">ติดต่อเรา</a></li>
             </ul>
             <div class="nav-actions">
-                <a href="/add-product" class="btn btn-outline">➕ เพิ่มสินค้า</a>
                 <a href="/cart" class="btn btn-red">🛒 ตะกร้า ({len(cart)})</a>
+                <a href="/admin-login" class="btn btn-outline" style="font-size: 11px; padding: 6px 10px;">🔒 ผู้ดูแลระบบ</a>
             </div>
         </nav>
 
         <div class="hero">
-            <a href="/change-hero-bg" class="change-bg-btn">🖼️ เปลี่ยนรูปพื้นหลัง</a>
             <div class="container">
                 <div class="hero-content">
                     <div class="hero-subtitle">สร้างสรรค์เพื่อความแรง</div>
@@ -403,25 +513,6 @@ def index():
         </div>
 
         <div class="container" id="products">
-            
-            <!-- 📊 สรุปสต็อกรวม และ ยอดขายรวมทั้งร้าน -->
-            <div class="stock-dashboard">
-                <div class="stock-stat-card total">
-                    <div>
-                        <div class="stat-lbl">📦 จำนวนสินค้าคงเหลือรวม</div>
-                        <div class="stat-val">{total_stock_all:,} <span style="font-size:14px; font-weight:normal; color:#aaa;">ชิ้น</span></div>
-                    </div>
-                    <div style="font-size:30px;">🏬</div>
-                </div>
-                <div class="stock-stat-card sales">
-                    <div>
-                        <div class="stat-lbl">🔥 จำนวนสินค้าขายออกแล้ว</div>
-                        <div class="stat-val" style="color: #00ff66;">{total_sold_all:,} <span style="font-size:14px; font-weight:normal; color:#aaa;">ชิ้น</span></div>
-                    </div>
-                    <div style="font-size:30px;">🚀</div>
-                </div>
-            </div>
-
             <div class="section-header">
                 <h2 class="section-title">{title_display}</h2>
                 <a href="/" style="color: #e50914; font-size: 13px; font-weight: 700;">ดูทั้งหมด &gt;</a>
@@ -436,9 +527,12 @@ def index():
     """
     return render_template_string(html)
 
-# ===== 2. เพิ่มสินค้าใหม่ (รองรับการใส่สต็อก) =====
+# ===== 2. เพิ่มสินค้าใหม่ (Admin Only) =====
 @app.route('/add-product', methods=['GET', 'POST'])
 def add_product():
+    if not is_admin_logged_in():
+        return redirect(url_for('admin_login'))
+
     if request.method == 'POST':
         name = request.form.get('name')
         price = float(request.form.get('price', 0))
@@ -459,7 +553,7 @@ def add_product():
                      (name, price, desc, category, image_b64, stock))
         conn.commit()
         conn.close()
-        return '<script>alert("✅ เพิ่มสินค้าเรียบร้อย!"); location.href="/";</script>'
+        return '<script>alert("✅ เพิ่มสินค้าเรียบร้อย!"); location.href="/admin";</script>'
         
     html = f"""
     <!DOCTYPE html>
@@ -472,7 +566,7 @@ def add_product():
     <body>
         <nav class="navbar">
             <a href="/" class="logo">TKH<span>SHOP</span></a>
-            <a href="/" class="btn btn-outline">← กลับหน้าหลัก</a>
+            <a href="/admin" class="btn btn-outline">← กลับหน้าผู้ดูแล</a>
         </nav>
         <div class="container">
             <div class="form-card">
@@ -515,7 +609,7 @@ def add_product():
                     </div>
                     <br>
                     <button type="submit" class="btn btn-red" style="width:100%; padding: 12px;">💾 บันทึกสินค้า</button>
-                    <a href="/" class="btn btn-gray" style="width:100%; text-align:center; margin-top:10px; padding: 12px;">ยกเลิก</a>
+                    <a href="/admin" class="btn btn-gray" style="width:100%; text-align:center; margin-top:10px; padding: 12px;">ยกเลิก</a>
                 </form>
             </div>
         </div>
@@ -524,9 +618,12 @@ def add_product():
     """
     return html
 
-# ===== 3. แก้ไขสินค้า (ปรับเพิ่มสต็อก/ยอดขาย) =====
+# ===== 3. แก้ไขสินค้า (Admin Only) =====
 @app.route('/edit-product/<int:pid>', methods=['GET', 'POST'])
 def edit_product(pid):
+    if not is_admin_logged_in():
+        return redirect(url_for('admin_login'))
+
     conn = get_db()
     product = conn.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
     
@@ -554,7 +651,7 @@ def edit_product(pid):
                      (name, price, desc, category, image_b64, stock, sold, pid))
         conn.commit()
         conn.close()
-        return '<script>alert("✅ แก้ไขข้อมูลสินค้าสำเร็จ!"); location.href="/";</script>'
+        return '<script>alert("✅ แก้ไขข้อมูลสินค้าสำเร็จ!"); location.href="/admin";</script>'
         
     conn.close()
     
@@ -577,7 +674,7 @@ def edit_product(pid):
     <body>
         <nav class="navbar">
             <a href="/" class="logo">TKH<span>SHOP</span></a>
-            <a href="/" class="btn btn-outline">← กลับหน้าหลัก</a>
+            <a href="/admin" class="btn btn-outline">← กลับหน้าผู้ดูแล</a>
         </nav>
         <div class="container">
             <div class="form-card">
@@ -619,7 +716,7 @@ def edit_product(pid):
                     <br>
                     <button type="submit" class="btn btn-red" style="width:100%; padding: 12px;">🔄 อัปเดตข้อมูล</button>
                     <a href="/delete-product/{product['id']}" class="btn btn-gray" style="width:100%; text-align:center; margin-top:10px; padding: 12px; color: #ff4d4d;" onclick="return confirm('ยืนยันที่จะลบสินค้านี้ใช่หรือไม่?');">🗑️ ลบสินค้านี้</a>
-                    <a href="/" class="btn btn-gray" style="width:100%; text-align:center; margin-top:10px; padding: 12px;">ยกเลิก</a>
+                    <a href="/admin" class="btn btn-gray" style="width:100%; text-align:center; margin-top:10px; padding: 12px;">ยกเลิก</a>
                 </form>
             </div>
         </div>
@@ -628,7 +725,61 @@ def edit_product(pid):
     """
     return html
 
-# ===== 4. ตะกร้าสินค้า =====
+@app.route('/delete-product/<int:pid>')
+def delete_product(pid):
+    if not is_admin_logged_in():
+        return redirect(url_for('admin_login'))
+    
+    conn = get_db()
+    conn.execute("DELETE FROM products WHERE id = ?", (pid,))
+    conn.commit()
+    conn.close()
+    return '<script>alert("🗑️ ลบสินค้าเรียบร้อยแล้ว!"); location.href="/admin";</script>'
+
+@app.route('/change-hero-bg', methods=['GET', 'POST'])
+def change_hero_bg():
+    if not is_admin_logged_in():
+        return redirect(url_for('admin_login'))
+        
+    if request.method == 'POST':
+        bg_url = request.form.get('bg_url')
+        conn = get_db()
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('hero_bg', ?)", (bg_url,))
+        conn.commit()
+        conn.close()
+        return '<script>alert("✅ เปลี่ยนรูปพื้นหลังสำเร็จ!"); location.href="/admin";</script>'
+        
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>เปลี่ยนรูปพื้นหลัง - TKH Shop</title>
+        {COMMON_STYLE}
+    </head>
+    <body>
+        <nav class="navbar">
+            <a href="/" class="logo">TKH<span>SHOP</span></a>
+            <a href="/admin" class="btn btn-outline">← กลับหน้าผู้ดูแล</a>
+        </nav>
+        <div class="container">
+            <div class="form-card">
+                <h2 style="margin-bottom: 20px;">🖼️ เปลี่ยนรูปภาพพื้นหลัง (Hero Banner)</h2>
+                <form method="post">
+                    <div class="form-group">
+                        <label>ใส่ลิงก์รูปภาพ (Image URL):</label>
+                        <input type="text" name="bg_url" value="{get_hero_bg()}" required>
+                    </div>
+                    <button type="submit" class="btn btn-red" style="width:100%; padding: 12px;">💾 บันทึกรูปภาพ</button>
+                </form>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return html
+
+# ===== 4. ตะกร้าสินค้าและการชำระเงิน =====
 @app.route('/add-to-cart', methods=['POST'])
 def add_to_cart():
     pid = int(request.form.get('pid'))
@@ -649,6 +800,14 @@ def add_to_cart():
     })
     session['cart'] = cart
     return '<script>alert("✅ เพิ่มลงตะกร้าเรียบร้อย!"); location.href="/";</script>'
+
+@app.route('/remove/<int:idx>')
+def remove_from_cart(idx):
+    cart = session.get('cart', [])
+    if 0 <= idx < len(cart):
+        cart.pop(idx)
+        session['cart'] = cart
+    return redirect(url_for('cart'))
 
 @app.route('/cart')
 def cart():
@@ -696,50 +855,40 @@ def cart():
             <div style="background: #141414; padding: 20px; border-radius: 8px; border: 1px solid #e50914; margin-top: 20px; text-align: center;">
                 <span style="font-size: 18px; color: #aaa;">ยอดรวมทั้งหมด:</span>
                 <span style="font-size: 28px; font-weight: 800; color: #e50914; margin-left: 10px;">฿{total:,.2f}</span>
-            </div>
-            <div style="margin-top: 25px; display: flex; gap: 15px; justify-content: flex-end;">
-                <a href="/clear-cart" class="btn btn-gray">ล้างตะกร้า</a>
-                <a href="/checkout" class="btn btn-red" style="padding: 12px 30px; font-size: 16px;">ชำระเงินทันที &gt;</a>
+                <br><br>
+                <a href="/checkout" class="btn btn-red" style="width: 100%; padding: 14px; font-size: 18px;">💳 ชำระเงินผ่าน PromptPay QR</a>
             </div>
         """
-    html += "</div></body></html>"
+    html += """
+        </div>
+    </body>
+    </html>
+    """
     return html
 
-@app.route('/remove/<int:idx>')
-def remove(idx):
-    cart = session.get('cart', [])
-    if 0 <= idx < len(cart):
-        cart.pop(idx)
-        session['cart'] = cart
-    return '<script>location.href="/cart";</script>'
-
-@app.route('/clear-cart')
-def clear_cart():
-    session['cart'] = []
-    return '<script>location.href="/cart";</script>'
-
-# ===== 5. หน้าชำระเงิน =====
 @app.route('/checkout')
 def checkout():
     cart = session.get('cart', [])
     if not cart:
-        return '<script>alert("ตะกร้าว่างเปล่า!"); location.href="/";</script>'
-    
+        return redirect(url_for('index'))
+        
     total = sum(item['price'] for item in cart)
     
-    try:
-        img = generate_qr_image(PROMPTPAY_ID, amount=total)
-        buf = io.BytesIO()
-        img.save(buf, format='PNG')
-        img_b64 = base64.b64encode(buf.getvalue()).decode()
-        qr_src = f"data:image/png;base64,{img_b64}"
-    except Exception as e:
-        return f"❌ ผิดพลาดตอนสร้าง QR: {e}"
-
-    summary_html = ""
+    # สแกน PromptPay QR Code
+    img = generate_qr_image(PROMPTPAY_ID, total)
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    qr_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+    
+    # หักสต็อกและบวกยอดขายทันทีเมื่อสั่งซื้อชำระเงิน
+    conn = get_db()
     for item in cart:
-        summary_html += f"<div style='display:flex; justify-content:space-between; margin-bottom:8px; font-size:14px;'><span>{item['name']}</span><span style='color:#e50914; font-weight:bold;'>฿{item['price']:,.2f}</span></div>"
-
+        conn.execute("UPDATE products SET stock = MAX(0, stock - 1), sold = sold + 1 WHERE id = ?", (item['id'],))
+    conn.commit()
+    conn.close()
+    
+    session['cart'] = [] # ล้างตะกร้า
+    
     html = f"""
     <!DOCTYPE html>
     <html>
@@ -751,30 +900,15 @@ def checkout():
     <body>
         <nav class="navbar">
             <a href="/" class="logo">TKH<span>SHOP</span></a>
-            <a href="/cart" class="btn btn-outline">← กลับไปตะกร้า</a>
         </nav>
-        <div class="container" style="margin-top: 40px;">
-            <div style="background: #141414; padding: 30px; border-radius: 8px; max-width: 500px; margin: 0 auto; border: 1px solid #222; text-align: center;">
-                <h2 style="font-style: italic; text-transform: uppercase; margin-bottom: 20px; color: #fff;">ชำระเงินผ่าน QR CODE</h2>
-                
-                <div style="background: #080808; padding: 15px; border-radius: 6px; text-align: left; margin-bottom: 20px; border: 1px solid #222;">
-                    <h4 style="color: #aaa; margin-bottom: 10px; font-size: 12px; text-transform: uppercase;">สรุปรายการสั่งซื้อ:</h4>
-                    {summary_html}
-                    <hr style="border:0; border-top: 1px solid #222; margin: 10px 0;">
-                    <div style="display:flex; justify-content:space-between; font-weight:800; font-size:16px;">
-                        <span>ยอดชำระสุทธิ:</span>
-                        <span style="color:#e50914;">฿{total:,.2f}</span>
-                    </div>
-                </div>
-
-                <p style="color:#aaa; font-size:14px; margin-bottom: 15px;">สแกน QR Code ด้วยแอปธนาคารเพื่อโอนเงิน<br><strong style="color:#fff;">พร้อมเพย์: {PROMPTPAY_ID}</strong></p>
-                
-                <div style="background: #fff; padding: 12px; display: inline-block; border-radius: 8px; margin-bottom: 20px;">
-                    <img src="{qr_src}" style="max-width: 200px; display: block;">
-                </div>
-                
-                <p style="color: #00ff66; font-size: 13px; font-weight: 600; margin-bottom: 20px;">⚡ โอนแล้วระบบจะตัดสต็อกและยืนยันทันที</p>
-                <a href="/clear-and-home" class="btn btn-red" style="width: 100%; padding: 12px;">เสร็จสิ้น / กลับหน้าหลัก</a>
+        <div class="container" style="margin-top: 40px; text-align: center; max-width: 500px;">
+            <div style="background: #141414; padding: 30px; border-radius: 8px; border: 1px solid #222;">
+                <h2 style="color: #00ff66; margin-bottom: 10px;">สแกนเพื่อชำระเงิน</h2>
+                <p style="color: #aaa; margin-bottom: 20px;">ยอดชำระทั้งสิ้น: <strong style="color: #fff; font-size: 20px;">฿{total:,.2f}</strong></p>
+                <img src="data:image/png;base64,{qr_b64}" style="width: 250px; height: 250px; background: white; padding: 10px; border-radius: 8px;">
+                <p style="font-size: 12px; color: #888; margin-top: 15px;">ชื่อบัญชี: TKH Shop (PromptPay: {PROMPTPAY_ID})</p>
+                <br>
+                <a href="/" class="btn btn-red" style="width: 100%;">เสร็จสิ้น / กลับหน้าหลัก</a>
             </div>
         </div>
     </body>
@@ -782,66 +916,65 @@ def checkout():
     """
     return html
 
-# ==========================================
-# ⚡ ตัดสต็อก + เพิ่มยอดขาย + ส่งสัญญาณ ESP32
-# ==========================================
-@app.route('/clear-and-home')
-def clear_and_home():
-    global payment_triggered
-    payment_triggered = True  # สัญญาณไฟ ESP32
-    
-    cart = session.get('cart', [])
-    if cart:
-        conn = get_db()
-        for item in cart:
-            # ลดสต็อกลง 1 และ เพิ่มยอดขายขึ้น 1
-            conn.execute("UPDATE products SET stock = MAX(0, stock - 1), sold = sold + 1 WHERE id = ?", (item['id'],))
-        conn.commit()
-        conn.close()
-        
-    session['cart'] = []
-    return '<script>location.href="/";</script>'
-
-# ===== หน้าอื่นๆ =====
 @app.route('/about')
 def about():
-    cart = session.get('cart', [])
-    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>เกี่ยวกับเรา - TKH Shop</title>{COMMON_STYLE}</head><body>
-    <nav class="navbar"><a href="/" class="logo">TKH<span>SHOP</span></a><ul class="nav-links"><li><a href="/">หน้าแรก</a></li><li><a href="/about" style="color:#e50914;">เกี่ยวกับเรา</a></li><li><a href="/contact">ติดต่อเรา</a></li></ul><div class="nav-actions"><a href="/cart" class="btn btn-red">🛒 ตะกร้า ({len(cart)})</a></div></nav>
-    <div class="container" style="margin-top:40px;"><div style="background:#141414; padding:40px; border-radius:8px; border:1px solid #222;"><h1 style="font-size:32px; font-style:italic;">ร้านของเรา : ศูนย์รวมอะไหล่แต่งมอเตอร์ไซค์อันดับ 1</h1><p style="color:#ccc; margin-top:15px; line-height:1.8;">ยินดีต้อนรับสู่ TKH SHOP ผู้นำเข้าและจำหน่ายอะไหล่แต่ง มอเตอร์ไซค์ Honda ทุกรุ่น</p></div></div></body></html>"""
+    info = get_contact_info()
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>เกี่ยวกับเรา - TKH Shop</title>
+        {COMMON_STYLE}
+    </head>
+    <body>
+        <nav class="navbar">
+            <a href="/" class="logo">TKH<span>SHOP</span></a>
+            <a href="/" class="btn btn-outline">← กลับหน้าหลัก</a>
+        </nav>
+        <div class="container" style="margin-top: 40px; max-width: 800px;">
+            <div style="background: #141414; padding: 40px; border-radius: 8px; border: 1px solid #222;">
+                <h1 style="color: #e50914; font-style: italic; margin-bottom: 20px;">ABOUT TKH SHOP</h1>
+                <p style="line-height: 1.8; color: #ccc;">ยินดีต้อนรับสู่ TKH Shop ศูนย์รวมอะไหล่แต่งและอะไหล่แท้คุณภาพสูง สำหรับมอเตอร์ไซค์ Honda ทุกรุ่น เรามุ่งมั่นคัดสรรอะไหล่แต่งที่ดีที่สุด รับประกันคุณภาพและมาตรฐาน ตอบโจทย์ความต้องการของสายเชง สายซิ่ง และผู้ใช้รถทั่วไปทุกท่าน</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return html
 
 @app.route('/contact')
 def contact():
-    cart = session.get('cart', [])
     info = get_contact_info()
-    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>ติดต่อเรา - TKH Shop</title>{COMMON_STYLE}</head><body>
-    <nav class="navbar"><a href="/" class="logo">TKH<span>SHOP</span></a><ul class="nav-links"><li><a href="/">หน้าแรก</a></li><li><a href="/about">เกี่ยวกับเรา</a></li><li><a href="/contact" style="color:#e50914;">ติดต่อเรา</a></li></ul><div class="nav-actions"><a href="/cart" class="btn btn-red">🛒 ตะกร้า ({len(cart)})</a></div></nav>
-    <div class="container" style="margin-top:40px;"><div style="background:#141414; padding:30px; border-radius:8px; border:1px solid #222;"><h2 style="color:#e50914; margin-bottom:15px;">📞 ข้อมูลการติดต่อ</h2><p>เบอร์โทร: {info.get('phone', '-')}</p><p>Line: {info.get('line', '-')}</p><p>Facebook: {info.get('facebook', '-')}</p></div></div></body></html>"""
-
-@app.route('/delete-product/<int:pid>')
-def delete_product(pid):
-    conn = get_db()
-    conn.execute("DELETE FROM products WHERE id = ?", (pid,))
-    conn.commit()
-    conn.close()
-    return '<script>alert("🗑️ ลบสินค้าเรียบร้อย!"); location.href="/";</script>'
-
-@app.route('/change-hero-bg', methods=['GET', 'POST'])
-def change_hero_bg():
-    if request.method == 'POST':
-        file = request.files.get('bg_image')
-        if file and file.filename != '':
-            image_bytes = file.read()
-            encoded = base64.b64encode(image_bytes).decode('utf-8')
-            mime_type = file.mimetype or "image/png"
-            bg_b64 = f"data:{mime_type};base64,{encoded}"
-            conn = get_db()
-            conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('hero_bg', ?)", (bg_b64,))
-            conn.commit()
-            conn.close()
-            return '<script>alert("✅ เปลี่ยนรูปพื้นหลังเรียบร้อย!"); location.href="/";</script>'
-    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>เปลี่ยนรูปพื้นหลัง - TKH Shop</title>{COMMON_STYLE}</head><body><nav class="navbar"><a href="/" class="logo">TKH<span>SHOP</span></a></nav><div class="container"><div class="form-card"><h2>🖼️ เปลี่ยนรูปพื้นหลัง Banner</h2><form method="post" enctype="multipart/form-data"><div class="form-group"><input type="file" name="bg_image" accept="image/*" required></div><button type="submit" class="btn btn-red" style="width:100%;">บันทึก</button></form></div></div></body></html>"""
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>ติดต่อเรา - TKH Shop</title>
+        {COMMON_STYLE}
+    </head>
+    <body>
+        <nav class="navbar">
+            <a href="/" class="logo">TKH<span>SHOP</span></a>
+            <a href="/" class="btn btn-outline">← กลับหน้าหลัก</a>
+        </nav>
+        <div class="container" style="margin-top: 40px; max-width: 600px;">
+            <div style="background: #141414; padding: 40px; border-radius: 8px; border: 1px solid #222;">
+                <h2 style="color: #e50914; font-style: italic; margin-bottom: 20px;">📞 ข้อมูลการติดต่อ</h2>
+                <div style="line-height: 2; color: #ccc;">
+                    <p>📱 <strong>เบอร์โทรศัพท์:</strong> {info.get('phone', '')}</p>
+                    <p>💬 <strong>Line Official:</strong> {info.get('line', '')}</p>
+                    <p>📘 <strong>Facebook:</strong> {info.get('facebook', '')}</p>
+                    <p>📍 <strong>ที่อยู่ร้าน:</strong> {info.get('address', '')}</p>
+                    <p>⏰ <strong>เวลาทำการ:</strong> {info.get('hours', '')}</p>
+                </div>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return html
 
 if __name__ == '__main__':
-    webbrowser.open("http://127.0.0.1:5000")
     app.run(host='0.0.0.0', port=5000, debug=True)
